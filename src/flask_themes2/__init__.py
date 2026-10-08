@@ -39,8 +39,6 @@ from flask import json
 from flask import render_template
 from flask import send_from_directory
 from flask import url_for
-
-# Support >= Jinja 3.1
 from jinja2 import pass_context
 from jinja2 import TemplateNotFound
 from jinja2.loaders import BaseLoader
@@ -106,11 +104,9 @@ def global_theme_template(
     ctx: Context, templatename: str, fallback: bool = True
 ) -> str:
     theme = active_theme(ctx)
-    templatepath = f"_themes/{theme}/{templatename}"
-    if (not fallback) or template_exists(templatepath):
-        return templatepath
-    else:
-        return templatename
+    if not fallback:
+        return get_theme_template_name(theme, templatename)
+    return get_theme_manager().get_template(theme, templatename)
 
 
 @pass_context
@@ -183,13 +179,21 @@ def render_theme_template(
     if isinstance(theme, Theme):
         theme = theme.identifier
     context["_theme"] = theme
-    try:
-        return render_template(f"_themes/{theme}/{template_name}", **context)
-    except TemplateNotFound:
-        if _fallback:
-            return render_template(template_name, **context)
-        else:
-            raise
+    if not _fallback:
+        return render_template(get_theme_template_name(theme, template_name), **context)
+    return render_template(
+        get_theme_manager().get_template(theme, template_name), **context
+    )
+
+
+def get_theme_template_name(theme: Theme | str, template_name: str) -> str:
+    """
+    This returns the name under which the given theme's version of
+    ``template_name`` is exposed to Jinja, whether or not it exists.
+    """
+    if isinstance(theme, Theme):
+        theme = theme.identifier
+    return f"_themes/{theme}/{template_name}"
 
 
 ### convenience #########################################################
@@ -222,7 +226,25 @@ def static(themeid: str, filename: str) -> Response:
 
 
 def template_exists(templatename: str) -> bool:
-    return templatename in containable(current_app.jinja_env.list_templates())
+    """
+    This checks whether the current app can load a template with the given
+    name. The result is cached by the app's `ThemeManager` unless the Jinja
+    environment has ``auto_reload`` enabled.
+
+    :param templatename: The full template name, including any
+                         ``_themes/<identifier>/`` prefix.
+    """
+    return get_theme_manager().template_exists(templatename)
+
+
+def _loader_has_template(env: Environment, templatename: str) -> bool:
+    if env.loader is None:
+        return False
+    try:
+        env.loader.get_source(env, templatename)
+    except TemplateNotFound:
+        return False
+    return True
 
 
 ### loaders #############################################################
@@ -431,6 +453,7 @@ class ThemeManager:
         self.static_folder = static_folder
 
         self._themes: dict[str, Theme] | None = None
+        self._template_exists_cache: dict[str, bool] = {}
 
         #: This is a list of the loaders that will be used to load the themes.
         self.loaders: list[ThemeLoader] = []
@@ -487,6 +510,43 @@ class ThemeManager:
         application identifier is incorrect) will be skipped.
         """
         self._themes = self._load_themes()
+        self._template_exists_cache.clear()
+
+    def template_exists(self, templatename: str) -> bool:
+        """
+        This checks whether the bound app can load a template with the given
+        name. Lookups are cached, because Jinja only caches templates it
+        found and every miss would otherwise walk the app's and every
+        blueprint's loader. The cache is bypassed while the Jinja environment
+        has ``auto_reload`` enabled, so new theme overrides are picked up in
+        debug mode, and cleared by `refresh`.
+
+        :param templatename: The full template name, including any
+                             ``_themes/<identifier>/`` prefix.
+        """
+        env = self.app.jinja_env
+        if env.auto_reload:
+            return _loader_has_template(env, templatename)
+        cache = self._template_exists_cache
+        try:
+            return cache[templatename]
+        except KeyError:
+            exists = cache[templatename] = _loader_has_template(env, templatename)
+            return exists
+
+    def get_template(self, theme: Theme | str, template_name: str) -> str:
+        """
+        This returns the name to render for ``template_name`` in the given
+        theme: the theme's own version if it has one, otherwise the
+        application's ``template_name``.
+
+        :param theme: Either the identifier of the theme or a `Theme`.
+        :param template_name: The name of the template to look up.
+        """
+        themed_name = get_theme_template_name(theme, template_name)
+        if self.template_exists(themed_name):
+            return themed_name
+        return template_name
 
     def _load_themes(self) -> dict[str, Theme]:
         themes: dict[str, Theme] = {}
